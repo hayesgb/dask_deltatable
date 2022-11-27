@@ -1,19 +1,34 @@
+from __future__ import annotations
+
+import contextlib
 import json
 import os
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
+from typing import Union, Literal, Mapping
 
 import dask
+from dask.base import tokenize
+from dask.blockwise import BlockIndex
 import dask.dataframe as dd
+from dask.dataframe.core import Scalar
+from dask.dataframe.io.utils import _is_local_fs
 import pyarrow.parquet as pq
-from boto3 import Session
+# from boto3 import Session
 from dask.base import tokenize
 from dask.dataframe.io import from_delayed
 from dask.delayed import delayed
-from deltalake import DataCatalog, DeltaTable
+from dask.highlevelgraph import HighLevelGraph
+from deltalake import DataCatalog, DeltaTable, write_deltalake
 from fsspec.core import get_fs_token_paths
+from fsspec.utils import stringify_path
 from pyarrow import dataset as pa_ds
+import pyarrow as pa
 
+
+__all__ = ("to_delta_table", "read_delta_table")
+
+NONE_LABEL = "__null_dask_index__"
 
 class DeltaTableWrapper(object):
     path: str
@@ -344,3 +359,176 @@ def vacuum(
         path=path, version=None, columns=None, storage_options=storage_options
     )
     return dtw.vacuum(retention_hours=retention_hours, dry_run=dry_run)
+
+
+class ToDeltaTableFunctionWrapper:
+    """
+    DeltaTable Function-Wrapper Class
+
+    Writes a DataFrame partition into a DeltaTable.
+    When called, the function also requires the current block index
+    (via ``blockwise.BlockIndex``).
+    """
+
+    def __init__(
+        self,
+        table_or_uri,
+        fs,
+        schema,
+        partition_by,
+        mode,
+        storage_options,
+        file_options,
+    ):
+        self.table_or_uri=table_or_uri
+        self.fs=None
+        self.schema=schema
+        self.partition_by=partition_by
+        self.mode=mode
+        self.storage_options=storage_options
+        self.file_options=file_options
+
+    def __dask_tokenize__(self):
+        return (
+            self.table_or_uri,
+            self.fs,
+            self.schema,
+            self.partition_by,
+            self.mode,
+            self.storage_options
+        )
+
+    def __call__(self, df, block_index: tuple[int]):
+        # Get partition index from block index tuple
+        # part_i = block_index[0]
+        # filename = (
+        #     f"part.{part_i + self}.parquet"
+        #     if self.name_function is None
+        # )
+        print("call...")
+        return write_deltalake(
+            data=df,
+            table_or_uri=self.table_or_uri,
+            schema=self.schema,
+            partition_by=self.partition_by,
+            filesystem=self.fs,
+            mode=self.mode,
+            storage_options=self.storage_options,
+            file_options=self.file_options,
+        )
+
+
+def to_delta_table(
+    df:  dd.DataFrame,
+    table_or_uri: Union[str, DeltaTable],
+    schema: Optional[pa.Schema] = None,
+    partition_by: Optional[List[str]] = None,
+    fs: Optional[pa_fs.FileSystem] = None,
+    mode: Literal["error", "append", "overwrite", "ignore"] = "error",
+    storage_options: Optional[Dict[str, str]] = None,
+    compute=True,
+    compute_kwargs={},
+    file_options=None,
+) -> None:
+
+    """
+    Store Dask.dataframe to Parquet files
+    
+    Notes
+    -----
+    Each partition will be written to a separate file.
+    Parameters
+    ----------
+    df : dask.dataframe.DataFrame
+    table_or_uri : string or pathlib.Path
+        Destination directory for data.  Prepend with protocol like ``s3://``
+        or ``hdfs://`` for remote data.
+    schema : pyarrow.Schema, dict, "infer", or None, default "infer"
+        Global schema to use for the output dataset. Defaults to "infer", which
+        will infer the schema from the dask dataframe metadata. This is usually
+        sufficient for common schemas, but notably will fail for ``object``
+        dtype columns that contain things other than strings. These columns
+        will require an explicit schema be specified. The schema for a subset
+        of columns can be overridden by passing in a dict of column names to
+        pyarrow types (for example ``schema={"field": pa.string()}``); columns
+        not present in this dict will still be automatically inferred.
+        Alternatively, a full ``pyarrow.Schema`` may be passed, in which case
+        no schema inference will be done. Passing in ``schema=None`` will
+        disable the use of a global file schema - each written file may use a
+        different schema dependent on the dtypes of the corresponding
+        partition. Note that this argument is ignored by the "fastparquet"
+        engine.
+    partition_by : list, default None
+        Construct directory-based partitioning by splitting on these fields'
+        values. Each dask partition will result in one or more datafiles,
+        there will be no global groupby.
+    fs: 
+    storage_options : dict, default None
+        Key/value pairs to be passed on to the file-system backend, if any.
+    **kwargs :
+        Extra options to be passed on to the specific backend.
+    """
+
+    partition_by = partition_by or []
+
+    if isinstance(partition_by, str):
+        partition_by = [partition_by]
+    
+    # if isinstance(df, dd.DataFrame) and schema is not None:
+    #     data = 
+
+
+    if set(partition_by) - set(df.columns):
+        raise ValueError(
+            "Partitioning on non-existent column. "
+            "partition_on=%s ."
+            "columns=%s" % (str(partition_by), str(list(df.columns)))
+        )
+    
+    if hasattr(table_or_uri, "name"):
+        table_or_uri = stringify_path(table_or_uri)
+    fs, _, _ = get_fs_token_paths(table_or_uri, mode="wb", storage_options=storage_options)
+    # Trim any protocol information from the path before forwarding
+    path = fs._strip_protocol(table_or_uri)
+
+    annotations = dask.config.get("annotations", {})
+    if "retries" not in annotations and not _is_local_fs(fs):
+        ctx = dask.annotate(retries=5)
+    else:
+        ctx = contextlib.nullcontext()
+    
+    # Create Blockwise layer for delta_lake write
+    with ctx:
+        write_data = df.map_partitions(
+            ToDeltaTableFunctionWrapper(
+                table_or_uri=path,
+                fs=fs,
+                schema=schema,
+                partition_by=partition_by,
+                mode=mode,
+                storage_options=storage_options,
+                file_options=file_options,
+            ),
+        BlockIndex((df.npartitions,)),
+        # Pass in the original metadata to avoid
+        # metadata emulation in `map_partitions`.
+        # This is necessary, because we are not
+        # expecting a dataframe-like output.
+        meta=df._meta,
+        enforce_metadata=False,
+        transform_divisions=False,
+        align_dataframes=False,
+    )
+
+    final_name = f"store-{write_data._name}-{partition_by}-{mode}-{storage_options}"
+    dsk = {(final_name,0): (lambda x: None, write_data.__dask_keys__())}
+
+    # Convert write_data + dsk to computable collection
+    graph = HighLevelGraph.from_collections(final_name, dsk, dependencies=(write_data,))
+    out = Scalar(graph, final_name, "")
+
+    if compute:
+        out = out.compute(**compute_kwargs)
+
+    fs.invalidate_cache(table_or_uri)
+    return out

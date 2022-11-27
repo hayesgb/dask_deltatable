@@ -134,3 +134,6 @@ dmypy.json
 .pyre/
 .DS_Store
 junit/
+
+# notebooks, etc
+notebooks
