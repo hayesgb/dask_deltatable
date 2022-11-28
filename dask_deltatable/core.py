@@ -3,32 +3,51 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-from typing import Dict, List, Optional
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Mapping, Optional, Union
 from urllib.parse import urlparse
-from typing import Union, Literal, Mapping
 
 import dask
-from dask.base import tokenize
-from dask.blockwise import BlockIndex
 import dask.dataframe as dd
-from dask.dataframe.core import Scalar
-from dask.dataframe.io.utils import _is_local_fs
+import pyarrow as pa
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+
 # from boto3 import Session
 from dask.base import tokenize
+from dask.blockwise import BlockIndex
+from dask.dataframe.core import Scalar
 from dask.dataframe.io import from_delayed
+from dask.dataframe.io.utils import _is_local_fs
 from dask.delayed import delayed
 from dask.highlevelgraph import HighLevelGraph
 from deltalake import DataCatalog, DeltaTable, write_deltalake
+from deltalake._internal import write_new_deltalake
+from deltalake.table import (
+    MAX_SUPPORTED_WRITER_VERSION,
+    DeltaTable,
+    DeltaTableProtocolError,
+)
+from deltalake.writer import (
+    AddAction,
+    DeltaJSONEncoder,
+    delta_arrow_schema_from_pandas,
+    get_file_stats_from_metadata,
+    get_partitions_from_path,
+    try_get_deltatable,
+)
 from fsspec.core import get_fs_token_paths
 from fsspec.utils import stringify_path
-from pyarrow import dataset as pa_ds
-import pyarrow as pa
+
+PYARROW_MAJOR_VERSION = int(pa.__version__.split(".", maxsplit=1)[0])
 
 
 __all__ = ("to_delta_table", "read_delta_table")
 
 NONE_LABEL = "__null_dask_index__"
+
 
 class DeltaTableWrapper(object):
     path: str
@@ -372,54 +391,75 @@ class ToDeltaTableFunctionWrapper:
 
     def __init__(
         self,
-        table_or_uri,
+        table_uri,
         fs,
         schema,
-        partition_by,
+        partitioning,
         mode,
         storage_options,
         file_options,
+        current_version,
     ):
-        self.table_or_uri=table_or_uri
-        self.fs=None
-        self.schema=schema
-        self.partition_by=partition_by
-        self.mode=mode
-        self.storage_options=storage_options
-        self.file_options=file_options
+        self.table_uri = table_uri
+        self.fs = None
+        self.schema = schema
+        self.partitioning = partitioning
+        self.mode = mode
+        self.storage_options = storage_options
+        self.file_options = file_options
+        self.current_version = current_version
 
     def __dask_tokenize__(self):
         return (
-            self.table_or_uri,
+            self.table_uri,
             self.fs,
             self.schema,
-            self.partition_by,
+            self.partitioning,
             self.mode,
-            self.storage_options
+            self.storage_options,
         )
 
     def __call__(self, df, block_index: tuple[int]):
-        # Get partition index from block index tuple
-        # part_i = block_index[0]
-        # filename = (
-        #     f"part.{part_i + self}.parquet"
-        #     if self.name_function is None
-        # )
-        print("call...")
-        return write_deltalake(
-            data=df,
-            table_or_uri=self.table_or_uri,
+
+        data = pa.Table.from_pandas(df, schema=self.schema)
+        add_actions: List[AddAction] = []
+
+        def visitor(written_file: Any) -> None:
+            path, partition_values = get_partitions_from_path(written_file.path)
+            stats = get_file_stats_from_metadata(written_file.metadata)
+
+            # PyArrow added support for written_file.size in 9.0.0
+            if PYARROW_MAJOR_VERSION >= 9:
+                size = written_file.size
+            else:
+                size = self.fs.get_file_info([path])[0].size  # type: ignore
+
+            add_actions.append(
+                AddAction(
+                    path,
+                    size,
+                    partition_values,
+                    int(datetime.now().timestamp()),
+                    True,
+                    json.dumps(stats, cls=DeltaJSONEncoder),
+                )
+            )
+
+        return ds.write_dataset(
+            data=data,
+            base_dir=self.table_uri,
+            basename_template=f"{self.current_version + 1}-{uuid.uuid4()}-{{i}}.parquet",
+            format="parquet",
+            partitioning=self.partitioning,
             schema=self.schema,
-            partition_by=self.partition_by,
+            file_visitor=visitor,
+            existing_data_behavior="overwrite_or_ignore",
             filesystem=self.fs,
-            mode=self.mode,
-            storage_options=self.storage_options,
-            file_options=self.file_options,
-        )
+        ), add_actions
 
 
 def to_delta_table(
-    df:  dd.DataFrame,
+    df: dd.DataFrame,
     table_or_uri: Union[str, DeltaTable],
     schema: Optional[pa.Schema] = None,
     partition_by: Optional[List[str]] = None,
@@ -429,11 +469,15 @@ def to_delta_table(
     compute=True,
     compute_kwargs={},
     file_options=None,
+    overwrite_schema: bool = False,
+    name: str = "",
+    description: str = "",
+    configuration: str = ""
 ) -> None:
 
     """
     Store Dask.dataframe to Parquet files
-    
+
     Notes
     -----
     Each partition will be written to a separate file.
@@ -462,66 +506,107 @@ def to_delta_table(
         Construct directory-based partitioning by splitting on these fields'
         values. Each dask partition will result in one or more datafiles,
         there will be no global groupby.
-    fs: 
+    fs:
     storage_options : dict, default None
         Key/value pairs to be passed on to the file-system backend, if any.
     **kwargs :
         Extra options to be passed on to the specific backend.
     """
 
-    partition_by = partition_by or []
+    # We use Arrow to write the dataset.
+    # See https://arrow.apache.org/docs/python/generated/pyarrow.Table.html#pyarrow.Table.from_pandas
+    # for how pyarrow handles the index.
+    # if df._meta.index.name is not None:
+    # df = df.reset_index()
 
-    if isinstance(partition_by, str):
-        partition_by = [partition_by]
-    
-    # if isinstance(df, dd.DataFrame) and schema is not None:
-    #     data = 
+    meta, schema = delta_arrow_schema_from_pandas(df.head())
 
+    if fs is not None:
+        raise NotImplementedError
 
-    if set(partition_by) - set(df.columns):
-        raise ValueError(
-            "Partitioning on non-existent column. "
-            "partition_on=%s ."
-            "columns=%s" % (str(partition_by), str(list(df.columns)))
-        )
-    
-    if hasattr(table_or_uri, "name"):
-        table_or_uri = stringify_path(table_or_uri)
-    fs, _, _ = get_fs_token_paths(table_or_uri, mode="wb", storage_options=storage_options)
-    # Trim any protocol information from the path before forwarding
+    # Get the fs and trim any protocol information from the path before forwarding
+    fs, _, _ = get_fs_token_paths(
+        table_or_uri, mode="wb", storage_options=storage_options
+    )
     path = fs._strip_protocol(table_or_uri)
+
+    if isinstance(table_or_uri, str):
+        if "://" in table_or_uri:
+            table_uri = table_or_uri
+        else:
+            # Non-existant local paths are only accepted as fully-qualified URIs
+            table_uri = "file://" + str(Path(table_or_uri).absolute())
+        table = try_get_deltatable(table_or_uri, storage_options)
+    else:
+        table = table_or_uri
+        table_uri = table._table.table_uri()
+
+    if table:  # already exists
+        if schema != table.schema().to_pyarrow() and not (
+            mode == "overwrite" and overwrite_schema
+        ):
+            raise ValueError(
+                "Schema of data does not match table schema\n"
+                f"Table schema:\n{schema}\nData Schema:\n{table.schema().to_pyarrow()}"
+            )
+
+        if mode == "error":
+            raise AssertionError("DeltaTable already exists.")
+        elif mode == "ignore":
+            return
+
+        current_version = table.version()
+
+        if partition_by:
+            assert partition_by == table.metadata().partition_columns
+
+        if table.protocol().min_writer_version > MAX_SUPPORTED_WRITER_VERSION:
+            raise DeltaTableProtocolError(
+                "This table's min_writer_version is "
+                f"{table.protocol().min_writer_version}, "
+                "but this method only supports version 2."
+            )
+    else:  # creating a new table
+        current_version = -1
+
+    if partition_by:
+        partition_schema = pa.schema([schema.field(name) for name in partition_by])
+        partitioning = ds.partitioning(partition_schema, flavor="hive")
+    else:
+        partitioning = None
 
     annotations = dask.config.get("annotations", {})
     if "retries" not in annotations and not _is_local_fs(fs):
         ctx = dask.annotate(retries=5)
     else:
         ctx = contextlib.nullcontext()
-    
+
     # Create Blockwise layer for delta_lake write
     with ctx:
         write_data = df.map_partitions(
             ToDeltaTableFunctionWrapper(
-                table_or_uri=path,
+                table_uri=table_uri,
                 fs=fs,
                 schema=schema,
-                partition_by=partition_by,
+                partitioning=partitioning,
                 mode=mode,
                 storage_options=storage_options,
                 file_options=file_options,
+                current_version=current_version,
             ),
-        BlockIndex((df.npartitions,)),
-        # Pass in the original metadata to avoid
-        # metadata emulation in `map_partitions`.
-        # This is necessary, because we are not
-        # expecting a dataframe-like output.
-        meta=df._meta,
-        enforce_metadata=False,
-        transform_divisions=False,
-        align_dataframes=False,
-    )
+            BlockIndex((df.npartitions,)),
+            # Pass in the original metadata to avoid
+            # metadata emulation in `map_partitions`.
+            # This is necessary, because we are not
+            # expecting a dataframe-like output.
+            meta=df._meta,
+            enforce_metadata=False,
+            transform_divisions=False,
+            align_dataframes=False,
+        )
 
-    final_name = f"store-{write_data._name}-{partition_by}-{mode}-{storage_options}"
-    dsk = {(final_name,0): (lambda x: None, write_data.__dask_keys__())}
+    final_name = f"store-{write_data._name}-{partitioning}-{mode}-{storage_options}"
+    dsk = {(final_name, 0): (lambda x: None, write_data.__dask_keys__())}
 
     # Convert write_data + dsk to computable collection
     graph = HighLevelGraph.from_collections(final_name, dsk, dependencies=(write_data,))
@@ -530,5 +615,26 @@ def to_delta_table(
     if compute:
         out = out.compute(**compute_kwargs)
 
+    if table is None:
+        write_new_deltalake(
+            table_uri,
+            schema,
+            add_actions,
+            mode,
+            partition_by or [],
+            name,
+            description,
+            configuration,
+            storage_options,
+        )
+    else:
+        table._table.create_write_transaction(
+            add_actions,
+            mode,
+            partition_by or [],
+            schema,
+        )
+
     fs.invalidate_cache(table_or_uri)
+
     return out

@@ -135,5 +135,8 @@ dmypy.json
 .DS_Store
 junit/
 
+# vs code
+.vscode
+
 # notebooks, etc
 notebooks
