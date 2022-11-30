@@ -446,17 +446,20 @@ class ToDeltaTableFunctionWrapper:
                 )
             )
 
-        return ds.write_dataset(
-            data=data,
-            base_dir=self.table_uri,
-            basename_template=f"{self.current_version + 1}-{uuid.uuid4()}-{{i}}.parquet",
-            format="parquet",
-            partitioning=self.partitioning,
-            schema=self.schema,
-            file_visitor=visitor,
-            existing_data_behavior="overwrite_or_ignore",
-            filesystem=self.fs,
-        ), add_actions
+        return (
+            ds.write_dataset(
+                data=data,
+                base_dir=self.table_uri,
+                basename_template=f"{self.current_version + 1}-{uuid.uuid4()}-{{i}}.parquet",
+                format="parquet",
+                partitioning=self.partitioning,
+                schema=self.schema,
+                file_visitor=visitor,
+                existing_data_behavior="overwrite_or_ignore",
+                filesystem=self.fs,
+            ),
+            add_actions,
+        )
 
 
 def get_partitions_from_path(path: str) -> Tuple[str, Dict[str, Optional[str]]]:
@@ -465,7 +468,7 @@ def get_partitions_from_path(path: str) -> Tuple[str, Dict[str, Optional[str]]]:
     parts = path.split("/")
     parts.pop()  # remove filename
     out: Dict[str, Optional[str]] = {}
-    
+
     for part in parts:
         if part == "" or "=" not in part:
             continue
@@ -479,19 +482,17 @@ def get_partitions_from_path(path: str) -> Tuple[str, Dict[str, Optional[str]]]:
 
 @delayed
 def _write_dataset(
-        df,
-        table_uri,
-        fs,
-        schema,
-        partitioning,
-        mode,
-        storage_options,
-        file_options,
-        current_version
-        ):
-    """
-    
-    """
+    df,
+    table_uri,
+    fs,
+    schema,
+    partitioning,
+    mode,
+    storage_options,
+    file_options,
+    current_version,
+):
+    """ """
     data = pa.Table.from_pandas(df, schema=schema)
     add_actions: List[AddAction] = []
 
@@ -530,7 +531,6 @@ def _write_dataset(
     return add_actions
 
 
-
 def to_delta_table(
     df: dd.DataFrame,
     table_or_uri: Union[str, DeltaTable],
@@ -545,7 +545,7 @@ def to_delta_table(
     overwrite_schema: bool = False,
     name: str = "",
     description: str = "",
-    configuration: dict = {}
+    configuration: dict = {},
 ) -> None:
 
     """
@@ -657,10 +657,23 @@ def to_delta_table(
         ctx = dask.annotate(retries=5)
     else:
         ctx = contextlib.nullcontext()
-    
+
     with ctx:
         dfs = df.to_delayed()
-        results = [_write_dataset(df, table_uri, fs, schema, partitioning, mode, storage_options, file_options, current_version)  for df in dfs]
+        results = [
+            _write_dataset(
+                df,
+                table_uri,
+                fs,
+                schema,
+                partitioning,
+                mode,
+                storage_options,
+                file_options,
+                current_version,
+            )
+            for df in dfs
+        ]
 
     results = dask.compute(*results, **compute_kwargs)
     add_actions = list(chain.from_iterable(results))
