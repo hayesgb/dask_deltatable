@@ -5,6 +5,7 @@ import json
 import os
 import uuid
 from datetime import datetime
+from itertools import chain
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Mapping, Optional, Union
 from urllib.parse import urlparse
@@ -33,11 +34,11 @@ from deltalake.table import (
 from deltalake.writer import (
     AddAction,
     DeltaJSONEncoder,
-    delta_arrow_schema_from_pandas,
     get_file_stats_from_metadata,
-    get_partitions_from_path,
+    # get_partitions_from_path,
     try_get_deltatable,
 )
+from deltalake.schema import delta_arrow_schema_from_pandas
 from fsspec.core import get_fs_token_paths
 from fsspec.utils import stringify_path
 
@@ -458,6 +459,78 @@ class ToDeltaTableFunctionWrapper:
         ), add_actions
 
 
+def get_partitions_from_path(path: str) -> Tuple[str, Dict[str, Optional[str]]]:
+    if path[0] == "/":
+        path = path[1:]
+    parts = path.split("/")
+    parts.pop()  # remove filename
+    out: Dict[str, Optional[str]] = {}
+    
+    for part in parts:
+        if part == "" or "=" not in part:
+            continue
+        key, value = part.split("=", maxsplit=1)
+        if value == "__HIVE_DEFAULT_PARTITION__":
+            out[key] = None
+        else:
+            out[key] = value
+    return path, out
+
+
+@delayed
+def _write_dataset(
+        df,
+        table_uri,
+        fs,
+        schema,
+        partitioning,
+        mode,
+        storage_options,
+        file_options,
+        current_version
+        ):
+    """
+    
+    """
+    data = pa.Table.from_pandas(df, schema=schema)
+    add_actions: List[AddAction] = []
+
+    def visitor(written_file: Any) -> None:
+        path, partition_values = get_partitions_from_path(written_file.path)
+        stats = get_file_stats_from_metadata(written_file.metadata)
+
+        # PyArrow added support for written_file.size in 9.0.0
+        if PYARROW_MAJOR_VERSION >= 9:
+            size = written_file.size
+        else:
+            size = fs.get_file_info([path])[0].size  # type: ignore
+
+        add_actions.append(
+            AddAction(
+                path,
+                size,
+                partition_values,
+                int(datetime.now().timestamp()),
+                True,
+                json.dumps(stats, cls=DeltaJSONEncoder),
+            )
+        )
+
+    ds.write_dataset(
+        data=data,
+        base_dir=table_uri,
+        basename_template=f"{current_version + 1}-{uuid.uuid4()}-{{i}}.parquet",
+        format="parquet",
+        partitioning=partitioning,
+        schema=schema,
+        file_visitor=visitor,
+        existing_data_behavior="overwrite_or_ignore",
+        filesystem=fs,
+    )
+    return add_actions
+
+
+
 def to_delta_table(
     df: dd.DataFrame,
     table_or_uri: Union[str, DeltaTable],
@@ -472,7 +545,7 @@ def to_delta_table(
     overwrite_schema: bool = False,
     name: str = "",
     description: str = "",
-    configuration: str = ""
+    configuration: dict = {}
 ) -> None:
 
     """
@@ -519,27 +592,31 @@ def to_delta_table(
     # if df._meta.index.name is not None:
     # df = df.reset_index()
 
+    if isinstance(partition_by, str):
+        partition_by = [partition_by]
+
     meta, schema = delta_arrow_schema_from_pandas(df.head())
 
     if fs is not None:
         raise NotImplementedError
 
     # Get the fs and trim any protocol information from the path before forwarding
-    fs, _, _ = get_fs_token_paths(
+    fs, _, paths = get_fs_token_paths(
         table_or_uri, mode="wb", storage_options=storage_options
     )
-    path = fs._strip_protocol(table_or_uri)
+    table_uri = fs._strip_protocol(table_or_uri)
 
-    if isinstance(table_or_uri, str):
-        if "://" in table_or_uri:
-            table_uri = table_or_uri
-        else:
-            # Non-existant local paths are only accepted as fully-qualified URIs
-            table_uri = "file://" + str(Path(table_or_uri).absolute())
-        table = try_get_deltatable(table_or_uri, storage_options)
-    else:
-        table = table_or_uri
-        table_uri = table._table.table_uri()
+    # if isinstance(table_or_uri, str):
+    #     if "://" in table_or_uri:
+    #         table_uri = table_or_uri
+    #     else:
+    #         # Non-existant local paths are only accepted as fully-qualified URIs
+    #         table_uri = "file://" + str(Path(table_or_uri).absolute())
+    #         # table_uri = str(Path(table_or_uri).absolute())
+    table = try_get_deltatable(table_or_uri, storage_options)
+    # else:
+    #     table = table_or_uri
+    #     table_uri = table._table.table_uri()
 
     if table:  # already exists
         if schema != table.schema().to_pyarrow() and not (
@@ -580,40 +657,17 @@ def to_delta_table(
         ctx = dask.annotate(retries=5)
     else:
         ctx = contextlib.nullcontext()
-
-    # Create Blockwise layer for delta_lake write
+    
     with ctx:
-        write_data = df.map_partitions(
-            ToDeltaTableFunctionWrapper(
-                table_uri=table_uri,
-                fs=fs,
-                schema=schema,
-                partitioning=partitioning,
-                mode=mode,
-                storage_options=storage_options,
-                file_options=file_options,
-                current_version=current_version,
-            ),
-            BlockIndex((df.npartitions,)),
-            # Pass in the original metadata to avoid
-            # metadata emulation in `map_partitions`.
-            # This is necessary, because we are not
-            # expecting a dataframe-like output.
-            meta=df._meta,
-            enforce_metadata=False,
-            transform_divisions=False,
-            align_dataframes=False,
-        )
+        dfs = df.to_delayed()
+        results = [_write_dataset(df, table_uri, fs, schema, partitioning, mode, storage_options, file_options, current_version)  for df in dfs]
 
-    final_name = f"store-{write_data._name}-{partitioning}-{mode}-{storage_options}"
-    dsk = {(final_name, 0): (lambda x: None, write_data.__dask_keys__())}
-
-    # Convert write_data + dsk to computable collection
-    graph = HighLevelGraph.from_collections(final_name, dsk, dependencies=(write_data,))
-    out = Scalar(graph, final_name, "")
-
-    if compute:
-        out = out.compute(**compute_kwargs)
+    results = dask.compute(*results, **compute_kwargs)
+    add_actions = list(chain.from_iterable(results))
+    # for result in results:
+    #     for r in result:
+    #         for i in j:
+    #             add_actions.append(i)
 
     if table is None:
         write_new_deltalake(
@@ -636,5 +690,3 @@ def to_delta_table(
         )
 
     fs.invalidate_cache(table_or_uri)
-
-    return out
